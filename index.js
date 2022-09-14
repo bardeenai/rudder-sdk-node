@@ -1,7 +1,6 @@
 const assert = require("assert");
 const removeSlash = require("remove-trailing-slash");
 const looselyValidate = require("@segment/loosely-validate-event");
-const serialize = require("serialize-javascript");
 const axios = require("axios");
 const axiosRetry = require("axios-retry");
 const ms = require("ms");
@@ -10,7 +9,6 @@ const md5 = require("md5");
 const isString = require("lodash.isstring");
 const cloneDeep = require("lodash.clonedeep");
 const version = require("./package.json").version;
-
 const setImmediate = global.setImmediate || process.nextTick.bind(process);
 const noop = () => {};
 
@@ -35,11 +33,6 @@ class Analytics {
     assert(dataPlaneURL, "You must pass your data plane url.");
 
     this.queue = [];
-    this.pQueue = undefined;
-    this.pQueueInitialized = false;
-    this.pQueueOpts = undefined;
-    this.pJobOpts = {};
-    this.state = "idle"; // this variable is not being used anymore. Previously it is used to prevent concurrency, added at the time of persistance support is added.
     this.writeKey = writeKey;
     this.host = removeSlash(dataPlaneURL);
     this.timeout = options.timeout || false;
@@ -363,15 +356,10 @@ class Analytics {
       callback(err, data);
     };
 
-    // Don't set the user agent if we're not on a browser. The latest spec allows
-    // the User-Agent header (see https://fetch.spec.whatwg.org/#terminology-headers
-    // and https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequest/setRequestHeader),
-    // but browsers such as Chrome and Safari have not caught up.
-    const headers = {};
-    if (typeof window === "undefined") {
-      headers["user-agent"] = `analytics-node/${version}`;
-    }
-
+    const headers = {
+      "Content-Type": "application/json",
+    };
+    
     const req = {
       method: "POST",
       url: `${this.host}`,
@@ -380,69 +368,39 @@ class Analytics {
       },
       data,
       headers,
+      responseType: "text",
+      "axios-retry": {
+        retries: 3,
+        retryCondition: this._isErrorRetryable.bind(this),
+        retryDelay: axiosRetry.exponentialDelay,
+      }
     };
-
+    
     if (this.timeout) {
       req.timeout =
         typeof this.timeout === "string" ? ms(this.timeout) : this.timeout;
     }
 
-    if (this.pQueue && this.pQueueInitialized) {
-      const eventData = {
-        description: `node-${md5(JSON.stringify(req))}-${uuidv4()}`,
-        request: req,
-        callbacks,
-        attempts: 0,
-      };
-      // using serialize library as default JSON.stringify mangles with function/callback serialization
-      this.pQueue
-        .add({ eventData: serialize(eventData) })
-        .then((pushedJob) => {
-          this.logger.debug("pushed job to queue");
-          this.timer = setTimeout(this.flush.bind(this), this.flushInterval);
-          this.state = "idle";
-        })
-        .catch((error) => {
-          this.timer = setTimeout(this.flush.bind(this), this.flushInterval);
-          this.queue.unshift(items);
-          this.state = "idle";
-          this.logger.error(
-            "failed to push to redis queue, in-memory queue size: " +
-              this.queue.length
-          );
-          throw error;
-        });
-    } else if (!this.pQueue) {
-      axios({
-        ...req,
-        "axios-retry": {
-          retries: 3,
-          retryCondition: this._isErrorRetryable.bind(this),
-          retryDelay: axiosRetry.exponentialDelay,
-        },
+    axios(req)
+      .then((response) => {
+        this.timer = setTimeout(this.flush.bind(this), this.flushInterval);
+        this.state = "idle";
+        done();
       })
-        .then((response) => {
-          this.timer = setTimeout(this.flush.bind(this), this.flushInterval);
-          this.state = "idle";
-          done();
-        })
-        .catch((err) => {
-          this.logger.error(
-            "got error while attempting send for 3 times, dropping " +
-              items.length +
-              " events"
-          );
-          this.timer = setTimeout(this.flush.bind(this), this.flushInterval);
-          this.state = "idle";
-          if (err.response) {
-            const error = new Error(err.response.statusText);
-            return done(error);
-          }
-          done(err);
-        });
-    } else {
-      throw new Error("persistent queue not ready");
-    }
+      .catch((err) => {
+        this.logger.error(
+          "got error while attempting send for 3 times, dropping " +
+            items.length +
+            " events: \n" + err
+        );
+        this.timer = setTimeout(this.flush.bind(this), this.flushInterval);
+        this.state = "idle";
+        if (err.response) {
+          const error = new Error(err.response.statusText);
+          return done(error);
+        }
+        done(err);
+      });
   }
 
   _isErrorRetryable(error) {
